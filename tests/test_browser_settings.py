@@ -45,6 +45,40 @@ async def test_launch_login_context_uses_persistent_context_when_enabled(monkeyp
 
 	assert result is context
 	assert calls['profile_dir'] == str(settings.profile_dir)
+	assert 'args' not in calls['kwargs']
+
+
+@pytest.mark.asyncio
+async def test_launch_login_context_adds_host_resolver_rules(monkeypatch, tmp_path):
+	calls = {}
+	context = SimpleNamespace()
+
+	async def fake_launch_persistent_context_async(profile_dir, **kwargs):
+		calls['profile_dir'] = profile_dir
+		calls['kwargs'] = kwargs
+		return context
+
+	monkeypatch.setitem(
+		sys.modules,
+		'cloakbrowser',
+		SimpleNamespace(launch_persistent_context_async=fake_launch_persistent_context_async),
+	)
+
+	settings = load_browser_login_settings('Account 1', 'anyrouter', persist_profile=True)
+	settings = settings.__class__(
+		headless=settings.headless,
+		humanize=False,
+		wait_timeout_ms=settings.wait_timeout_ms,
+		profile_dir=tmp_path / 'profiles' / 'anyrouter' / 'Account 1',
+		cloakbrowser_binary_path=settings.cloakbrowser_binary_path,
+		persist_profile=settings.persist_profile,
+	)
+
+	result = await launch_login_context(settings, host_fallbacks={'anyrouter.top': '47.246.23.192'})
+
+	assert result is context
+	assert calls['profile_dir'] == str(settings.profile_dir)
+	assert calls['kwargs']['args'] == ['--host-resolver-rules=MAP anyrouter.top 47.246.23.192']
 
 
 @pytest.mark.asyncio

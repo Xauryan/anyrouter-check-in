@@ -209,7 +209,10 @@
     "user_info_path": "/api/profile",
     "api_user_key": "New-Api-User",
     "bypass_method": "waf_cookies",
-    "waf_cookie_names": ["acw_tc", "cdn_sec_tc", "acw_sc__v2"]
+    "waf_cookie_names": ["acw_tc", "cdn_sec_tc", "acw_sc__v2"],
+    "host_fallbacks": {
+      "custom.example.com": "192.0.2.10"
+    }
   }
 }
 ```
@@ -239,6 +242,7 @@
   - `"waf_cookies"`：使用 CloakBrowser 打开浏览器获取 WAF cookies 后再执行签到
   - 不设置或 `null`：直接使用用户 cookies 执行签到（适合无 WAF 保护的网站）
 - `waf_cookie_names` (可选)：绕过 WAF 所需 cookie 的名称列表，`bypass_method` 为 `waf_cookies` 时必须设置
+- `host_fallbacks` (可选)：连接失败后的 hosts 风格解析 fallback，例如 `{"anyrouter.top": "47.246.23.192"}`；脚本会先正常请求域名，遇到连接或 DNS 失败后才用固定 IP 重试，URL、Host 与 TLS SNI 仍保持原域名
 
 **配置示例**（完整）：
 
@@ -250,7 +254,10 @@
     "sign_in_path": "/api/checkin",
     "user_info_path": "/api/profile",
     "api_user_key": "x-user-id",
-    "bypass_method": "waf_cookies"
+    "bypass_method": "waf_cookies",
+    "host_fallbacks": {
+      "custom.example.com": "192.0.2.10"
+    }
   }
 }
 ```
@@ -260,6 +267,7 @@
 - `anyrouter`：
   - `bypass_method: "waf_cookies"`（需要先获取 WAF cookies，然后执行签到）
   - `sign_in_path: "/api/user/sign_in"`
+  - `host_fallbacks: {"anyrouter.top": "47.246.23.192"}`（域名连接失败时自动 fallback）
 - `agentrouter`：
   - `bypass_method: "waf_cookies"`（需要获取 `acw_tc`）
   - `sign_in_path: null`（查询用户信息时自动签到）
@@ -269,6 +277,7 @@
 
 - `PROVIDERS` 是可选的，不配置则使用内置的 `anyrouter` 和 `agentrouter`
 - 自定义的 provider 配置会覆盖同名的默认配置
+- 如果需要关闭内置 `anyrouter` 的固定 IP fallback，可在 `PROVIDERS` 中设置 `"host_fallbacks": {}`
 
 ## 代理配置（可选）
 

@@ -35,6 +35,7 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config
 from utils.debug import debug_print, is_debug_enabled
+from utils.host_fallback import HostFallbackClient, browser_host_resolver_args, is_browser_connection_failure
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
@@ -93,6 +94,7 @@ async def get_waf_cookies_with_browser(
 	required_cookies: list[str],
 	*,
 	use_proxy: bool = False,
+	host_fallbacks: dict[str, str] | None = None,
 ):
 	"""使用浏览器获取 WAF cookies"""
 	print(f'[PROCESSING] {account_name}: Starting browser to get WAF cookies...')
@@ -101,41 +103,58 @@ async def get_waf_cookies_with_browser(
 	proxy = get_playwright_proxy(use_proxy=use_proxy)
 	if proxy:
 		launch_kwargs['proxy'] = proxy
-	browser = await launch_async(**launch_kwargs)
+
+	async def collect_cookies(*, use_host_fallback: bool = False):
+		attempt_launch_kwargs = launch_kwargs.copy()
+		if use_host_fallback:
+			args = browser_host_resolver_args(host_fallbacks)
+			if args:
+				attempt_launch_kwargs['args'] = args
+				print(f'[INFO] {account_name}: Browser hosts fallback enabled for WAF cookie request')
+
+		browser = await launch_async(**attempt_launch_kwargs)
+		try:
+			page = await browser.new_page()
+			await prepare_browser_page(page)
+			print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
+
+			await page.goto(login_url, wait_until='domcontentloaded')
+			await wait_for_waf_ready(page)
+
+			cookies = await page.context.cookies()
+
+			waf_cookies = {}
+			for cookie in cookies:
+				cookie_name = cookie.get('name')
+				cookie_value = cookie.get('value')
+				if cookie_name in required_cookies and cookie_value is not None:
+					waf_cookies[cookie_name] = cookie_value
+
+			print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
+
+			missing_cookies = [c for c in required_cookies if c not in waf_cookies]
+
+			if missing_cookies:
+				print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
+				return None
+
+			print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
+			return waf_cookies
+		finally:
+			await browser.close()
 
 	try:
-		page = await browser.new_page()
-		await prepare_browser_page(page)
-		print(f'[PROCESSING] {account_name}: Access login page to get initial cookies...')
-
-		await page.goto(login_url, wait_until='domcontentloaded')
-		await wait_for_waf_ready(page)
-
-		cookies = await page.context.cookies()
-
-		waf_cookies = {}
-		for cookie in cookies:
-			cookie_name = cookie.get('name')
-			cookie_value = cookie.get('value')
-			if cookie_name in required_cookies and cookie_value is not None:
-				waf_cookies[cookie_name] = cookie_value
-
-		print(f'[INFO] {account_name}: Got {len(waf_cookies)} WAF cookies')
-
-		missing_cookies = [c for c in required_cookies if c not in waf_cookies]
-
-		if missing_cookies:
-			print(f'[FAILED] {account_name}: Missing WAF cookies: {missing_cookies}')
-			await browser.close()
-			return None
-
-		print(f'[SUCCESS] {account_name}: Successfully got all WAF cookies')
-		await browser.close()
-		return waf_cookies
+		return await collect_cookies()
 
 	except Exception as e:
+		if host_fallbacks and is_browser_connection_failure(e):
+			print(f'[WARN] {account_name}: WAF cookie browser connection failed, retrying with hosts fallback: {e}')
+			try:
+				return await collect_cookies(use_host_fallback=True)
+			except Exception as retry_error:
+				print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {retry_error}')
+				return None
 		print(f'[FAILED] {account_name}: Error occurred while getting WAF cookies: {e}')
-		await browser.close()
 		return None
 
 
@@ -168,69 +187,91 @@ async def login_with_credentials(
 		f'({provider_name})'
 	)
 
-	try:
-		context = await launch_login_context(settings, use_proxy=provider_config.use_proxy)
-	except Exception as e:
-		print(f'[FAILED] {account_name}: Browser launch failed: {e}')
-		return None
+	async def attempt_login(*, use_host_fallback: bool = False) -> BrowserLoginResult | None:
+		if use_host_fallback:
+			print(f'[INFO] {account_name}: Browser hosts fallback enabled for login')
 
-	page = None
-	try:
-		page = await context.new_page()
-		await prepare_browser_page(page)
-		await navigate_login_page(
-			page,
-			login_url,
-			timeout_ms,
-			provider=provider_name,
-			account_name=account_name,
-		)
+		try:
+			context = await launch_login_context(
+				settings,
+				use_proxy=provider_config.use_proxy,
+				host_fallbacks=provider_config.host_fallbacks if use_host_fallback else None,
+			)
+		except Exception as e:
+			print(f'[FAILED] {account_name}: Browser launch failed: {e}')
+			return None
 
-		if not await is_logged_in(page):
-			if await has_session_cookie(page):
-				print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
-			await save_login_screenshot(page, provider_name, account_name, 'before-email-login')
-			await login_with_email_form(
+		page = None
+		try:
+			page = await context.new_page()
+			await prepare_browser_page(page)
+			await navigate_login_page(
 				page,
-				email,
-				password,
+				login_url,
 				timeout_ms,
 				provider=provider_name,
 				account_name=account_name,
 			)
-		else:
-			print(f'[INFO] {account_name}: Browser profile already logged in')
 
-		console_url = f'{provider_config.domain}/console'
-		user_profile = await verify_browser_login(page, console_url, timeout_ms)
-		if not user_profile:
+			if not await is_logged_in(page):
+				if await has_session_cookie(page):
+					print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
+				await save_login_screenshot(page, provider_name, account_name, 'before-email-login')
+				await login_with_email_form(
+					page,
+					email,
+					password,
+					timeout_ms,
+					provider=provider_name,
+					account_name=account_name,
+				)
+			else:
+				print(f'[INFO] {account_name}: Browser profile already logged in')
+
+			console_url = f'{provider_config.domain}/console'
+			user_profile = await verify_browser_login(page, console_url, timeout_ms)
+			if not user_profile:
+				cookies = await context.cookies()
+				cookie_names = [c.get('name') for c in cookies if c.get('name')]
+				print(f'[FAILED] {account_name}: Login failed - /api/user/self not verified')
+				debug_print(f'[INFO] {account_name}: Current URL: {page.url}')
+				debug_print(f'[INFO] {account_name}: Got cookies: {cookie_names}')
+				await save_login_screenshot(page, provider_name, account_name, 'not-authenticated')
+				return None
+
 			cookies = await context.cookies()
-			cookie_names = [c.get('name') for c in cookies if c.get('name')]
-			print(f'[FAILED] {account_name}: Login failed - /api/user/self not verified')
-			debug_print(f'[INFO] {account_name}: Current URL: {page.url}')
-			debug_print(f'[INFO] {account_name}: Got cookies: {cookie_names}')
-			await save_login_screenshot(page, provider_name, account_name, 'not-authenticated')
+			all_cookies: dict[str, str] = {}
+			for cookie in cookies:
+				cookie_name = cookie.get('name')
+				cookie_value = cookie.get('value')
+				if isinstance(cookie_name, str) and isinstance(cookie_value, str) and cookie_name and cookie_value:
+					all_cookies[cookie_name] = cookie_value
+			api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
+
+			success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
+			if is_debug_enabled() and api_user:
+				success_msg += f', api_user={api_user}'
+			print(success_msg)
+			return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+
+		except Exception:
+			if page is not None:
+				await save_login_screenshot(page, provider_name, account_name, 'login-error')
+			raise
+		finally:
 			await context.close()
-			return None
 
-		cookies = await context.cookies()
-		all_cookies = {
-			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
-		}
-		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
-
-		success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
-		if is_debug_enabled() and api_user:
-			success_msg += f', api_user={api_user}'
-		print(success_msg)
-		await context.close()
-		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
-
+	try:
+		return await attempt_login()
 	except Exception as e:
+		if provider_config.host_fallbacks and is_browser_connection_failure(e):
+			print(f'[WARN] {account_name}: Browser login connection failed, retrying with hosts fallback: {e}')
+			try:
+				return await attempt_login(use_host_fallback=True)
+			except Exception as retry_error:
+				print(f'[FAILED] {account_name}: Error during login: {retry_error}')
+				return None
 		print(f'[FAILED] {account_name}: Error during login: {e}')
-		if page is not None:
-			await save_login_screenshot(page, provider_name, account_name, 'login-error')
-		await context.close()
 		return None
 
 
@@ -267,6 +308,7 @@ async def prepare_cookies(account_name: str, provider_config, user_cookies: dict
 			login_url,
 			provider_config.waf_cookie_names,
 			use_proxy=provider_config.use_proxy,
+			host_fallbacks=provider_config.host_fallbacks,
 		)
 		if not waf_cookies:
 			print(f'[FAILED] {account_name}: Unable to get WAF cookies')
@@ -430,6 +472,11 @@ def run_check_in_requests(
 
 		with httpx.Client(**client_kwargs) as client:
 			client.cookies.update(all_cookies)
+			request_client = HostFallbackClient(
+				client,
+				provider_config.host_fallbacks,
+				account_name=account_name,
+			)
 
 			headers = {
 				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
@@ -449,18 +496,18 @@ def run_check_in_requests(
 				headers[provider_config.api_user_key] = api_user
 
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
-			user_info_before = get_user_info(client, headers, user_info_url)
+			user_info_before = get_user_info(request_client, headers, user_info_url)
 			if user_info_before and user_info_before.get('success'):
 				print(user_info_before['display'])
 			elif user_info_before:
 				print(user_info_before.get('error', 'Unknown error'))
 
 			if provider_config.needs_manual_check_in():
-				success = execute_check_in(client, account_name, provider_config, headers)
-				user_info_after = get_user_info(client, headers, user_info_url)
+				success = execute_check_in(request_client, account_name, provider_config, headers)
+				user_info_after = get_user_info(request_client, headers, user_info_url)
 				return success, user_info_before, user_info_after
 
-			user_info_after = get_user_info(client, headers, user_info_url)
+			user_info_after = get_user_info(request_client, headers, user_info_url)
 			if user_info_after and user_info_after.get('success'):
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by user info request)')
 				return True, user_info_before, user_info_after

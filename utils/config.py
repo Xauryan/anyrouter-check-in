@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from typing import Dict, List, Literal
 
+from utils.host_fallback import normalize_host_fallbacks
+
 
 @dataclass
 class ProviderConfig:
@@ -23,6 +25,7 @@ class ProviderConfig:
 	waf_cookie_names: List[str] | None = None
 	use_proxy: bool = False
 	persist_profile: bool = False
+	host_fallbacks: dict[str, str] | None = None
 
 	def __post_init__(self):
 		required_waf_cookies = set()
@@ -39,6 +42,7 @@ class ProviderConfig:
 			self.bypass_method = None
 
 		self.waf_cookie_names = list(required_waf_cookies)
+		self.host_fallbacks = normalize_host_fallbacks(self.host_fallbacks)
 
 	@classmethod
 	def from_dict(cls, name: str, data: dict, *, defaults: 'ProviderConfig | None' = None) -> 'ProviderConfig':
@@ -50,6 +54,7 @@ class ProviderConfig:
 		"""
 		default_use_proxy = defaults.use_proxy if defaults else False
 		default_persist_profile = defaults.persist_profile if defaults else False
+		default_host_fallbacks = defaults.host_fallbacks if defaults else None
 		return cls(
 			name=name,
 			domain=data['domain'],
@@ -61,6 +66,7 @@ class ProviderConfig:
 			waf_cookie_names=data.get('waf_cookie_names', defaults.waf_cookie_names if defaults else None),
 			use_proxy=data.get('use_proxy', default_use_proxy),
 			persist_profile=data.get('persist_profile', default_persist_profile),
+			host_fallbacks=data.get('host_fallbacks', default_host_fallbacks),
 		)
 
 	def needs_waf_cookies(self) -> bool:
@@ -93,6 +99,7 @@ class AppConfig:
 				waf_cookie_names=['acw_tc', 'cdn_sec_tc', 'acw_sc__v2'],
 				use_proxy=False,
 				persist_profile=True,
+				host_fallbacks={'anyrouter.top': '47.246.23.192'},
 			),
 			'agentrouter': ProviderConfig(
 				name='agentrouter',

@@ -9,9 +9,10 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from utils.debug import debug_print, is_debug_enabled
+from utils.host_fallback import browser_host_resolver_args
 from utils.popups import dismiss_popups, setup_popup_guard
 from utils.proxy import get_playwright_proxy
 
@@ -200,7 +201,12 @@ class _EphemeralBrowserContext:
 			await self._browser.close()
 
 
-async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: bool = False) -> BrowserContext:
+async def launch_login_context(
+	settings: BrowserLoginSettings,
+	*,
+	use_proxy: bool = False,
+	host_fallbacks: dict[str, str] | None = None,
+) -> BrowserContext:
 	_ensure_binary_path(settings)
 
 	launch_kwargs: dict = {
@@ -208,6 +214,9 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		'humanize': settings.humanize,
 		'viewport': {'width': 1920, 'height': 1080},
 	}
+	host_resolver_args = browser_host_resolver_args(host_fallbacks)
+	if host_resolver_args:
+		launch_kwargs['args'] = host_resolver_args
 	if settings.humanize:
 		launch_kwargs['human_preset'] = 'careful'
 
@@ -225,14 +234,14 @@ async def launch_login_context(settings: BrowserLoginSettings, *, use_proxy: boo
 		from cloakbrowser import launch_persistent_context_async
 
 		settings.profile_dir.mkdir(parents=True, exist_ok=True)
-		return await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs)
+		return cast('BrowserContext', await launch_persistent_context_async(str(settings.profile_dir), **launch_kwargs))
 
 	from cloakbrowser import launch_async
 
 	context_kwargs = {'viewport': launch_kwargs.pop('viewport')}
 	browser = await launch_async(**launch_kwargs)
 	context = await browser.new_context(**context_kwargs)
-	return _EphemeralBrowserContext(context, browser)
+	return cast('BrowserContext', _EphemeralBrowserContext(context, browser))
 
 
 def get_screenshot_dir() -> Path:
@@ -295,7 +304,11 @@ async def wait_for_site_ready(page: Page, timeout_ms: int = WAF_READY_TIMEOUT_MS
 		print(f'[INFO] Dismissed {closed} popup dialog(s)')
 
 
-async def _wait_for_optional_load_state(page: Page, state: str, timeout_ms: int) -> bool:
+async def _wait_for_optional_load_state(
+	page: Page,
+	state: Literal['domcontentloaded', 'load', 'networkidle'],
+	timeout_ms: int,
+) -> bool:
 	try:
 		await page.wait_for_load_state(state, timeout=timeout_ms)
 		return True
