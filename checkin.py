@@ -34,12 +34,12 @@ from utils.browser import (
 	verify_browser_login,
 	wait_for_waf_ready,
 )
-from utils.config import AccountConfig, AppConfig, load_accounts_config
+from utils.config import AccountConfig, AppConfig, load_accounts_config, select_account_batch_from_env
 from utils.debug import debug_print, is_debug_enabled
 from utils.host_fallback import HostFallbackClient, browser_host_resolver_args, is_browser_connection_failure
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
-from utils.report import AccountCheckInResult, CheckInRunReport, save_check_in_report
+from utils.report import AccountCheckInResult, BatchRunInfo, CheckInRunReport, save_check_in_report
 
 load_dotenv()
 
@@ -614,8 +614,8 @@ async def main():
 		for provider_name, provider in sorted(app_config.providers.items()):
 			print(f'[INFO] Provider "{provider_name}": use_proxy={provider.use_proxy}')
 
-	accounts = load_accounts_config()
-	if not accounts:
+	all_accounts = load_accounts_config()
+	if not all_accounts:
 		error_msg = '[FAILED] Unable to load account configuration, program exits'
 		print(error_msg)
 		report.error = '无法加载账号配置，未执行签到'
@@ -624,7 +624,45 @@ async def main():
 		notify.push_message('AnyRouter Check-in Alert', error_msg, msg_type='text')
 		sys.exit(1)
 
-	print(f'[INFO] Found {len(accounts)} account configurations')
+	try:
+		batch = select_account_batch_from_env(all_accounts)
+	except ValueError as exc:
+		error_msg = f'[FAILED] Invalid account batch configuration: {exc}'
+		print(error_msg)
+		report.error = '账号批次配置无效，未执行签到'
+		report.finished_at = datetime.now().astimezone().isoformat(timespec='seconds')
+		save_check_in_report(report)
+		notify.push_message('AnyRouter Check-in Alert', error_msg, msg_type='text')
+		sys.exit(1)
+
+	accounts = batch.accounts
+	egress_fingerprint = os.getenv('CHECKIN_EGRESS_FINGERPRINT', '').strip() or None
+	if egress_fingerprint == 'unavailable':
+		egress_fingerprint = None
+	account_start = batch.start_index + 1 if accounts else 0
+	account_end = batch.end_index if accounts else 0
+	report.batch = BatchRunInfo(
+		index=batch.batch_index,
+		count=batch.batch_count,
+		total_accounts=batch.total_accounts,
+		account_start=account_start,
+		account_end=account_end,
+		account_count=len(accounts),
+		egress_fingerprint=egress_fingerprint,
+	)
+	print(f'[INFO] Found {batch.total_accounts} account configurations')
+	print(
+		f'[INFO] Batch {batch.batch_index + 1}/{batch.batch_count}: '
+		f'accounts {account_start}-{account_end} ({len(accounts)} account(s))'
+	)
+	if egress_fingerprint:
+		print(f'[INFO] Batch Runner egress fingerprint: {egress_fingerprint}')
+	if not accounts:
+		print('[INFO] Current account batch is empty; nothing to process')
+		report.finished_at = datetime.now().astimezone().isoformat(timespec='seconds')
+		save_check_in_report(report)
+		sys.exit(0)
+
 	report.accounts = [
 		AccountCheckInResult(
 			name=account.get_display_name(i),
@@ -653,15 +691,12 @@ async def main():
 			report.accounts[i].status = 'success' if success else 'failure'
 			if success:
 				report.accounts[i].reason = None
-			elif not (
-				(user_info_before and user_info_before.get('success'))
-				or (user_info_after and user_info_after.get('success'))
-			):
-				report.accounts[i].reason = '登录或用户信息获取失败（已重试）'
+			elif user_info_before is None and user_info_after is None:
+				report.accounts[i].reason = '登录验证失败（已重试）'
 			elif user_info_after and user_info_after.get('success'):
 				report.accounts[i].reason = '签到接口返回失败'
 			else:
-				report.accounts[i].reason = '签到或余额查询失败'
+				report.accounts[i].reason = '签到或余额接口返回失败'
 			if success:
 				success_count += 1
 
@@ -786,7 +821,11 @@ async def main():
 			screenshot_hint = f'[SCREENSHOT] {len(screenshot_paths)} debug screenshot(s) saved'
 			if github_run_id and github_repo:
 				run_url = f'https://github.com/{github_repo}/actions/runs/{github_run_id}'
-				screenshot_hint += f'. Download artifact `checkin-screenshots-{github_run_id}` from: {run_url}'
+				artifact_name = os.getenv(
+					'CHECKIN_SCREENSHOT_ARTIFACT',
+					f'checkin-screenshots-{github_run_id}',
+				)
+				screenshot_hint += f'. Download artifact `{artifact_name}` from: {run_url}'
 			else:
 				screenshot_hint += ' to `checkin_screenshots/`'
 			notify_content += f'\n\n{screenshot_hint}'

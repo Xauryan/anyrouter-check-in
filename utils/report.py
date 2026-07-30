@@ -6,10 +6,10 @@ import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 RESULTS_FILE_ENV = 'CHECKIN_RESULTS_FILE'
-REPORT_SCHEMA_VERSION = 2
+REPORT_SCHEMA_VERSION = 3
 
 CheckInStatus = Literal['pending', 'success', 'failure']
 
@@ -30,6 +30,19 @@ class AccountCheckInResult:
 	reason: str | None = None
 
 
+@dataclass(frozen=True)
+class BatchRunInfo:
+	"""可公开展示的批次与 Runner 网络诊断信息。"""
+
+	index: int
+	count: int
+	total_accounts: int
+	account_start: int
+	account_end: int
+	account_count: int
+	egress_fingerprint: str | None = None
+
+
 @dataclass
 class CheckInRunReport:
 	"""一次签到运行的公开结果。"""
@@ -38,6 +51,8 @@ class CheckInRunReport:
 	finished_at: str | None = None
 	accounts: list[AccountCheckInResult] = field(default_factory=list)
 	error: str | None = None
+	batch: BatchRunInfo | None = None
+	batches: list[BatchRunInfo] = field(default_factory=list)
 
 	def to_dict(self) -> dict[str, Any]:
 		"""转换成带版本号和统计信息的 JSON 对象。"""
@@ -54,6 +69,8 @@ class CheckInRunReport:
 			'pending_count': pending_count,
 			'accounts': [asdict(account) for account in self.accounts],
 			'error': self.error,
+			'batch': asdict(self.batch) if self.batch else None,
+			'batches': [asdict(batch) for batch in self.batches],
 		}
 
 
@@ -83,6 +100,160 @@ def load_check_in_report(path: str | Path) -> dict[str, Any]:
 	if not isinstance(payload.get('accounts'), list):
 		raise ValueError('签到结果缺少账号列表')
 	return payload
+
+
+def _strict_int(value: object) -> int | None:
+	if isinstance(value, bool) or not isinstance(value, int):
+		return None
+	return value
+
+
+def _public_money(value: object) -> float | None:
+	if isinstance(value, bool) or not isinstance(value, (int, float)):
+		return None
+	if not math.isfinite(value):
+		return None
+	return float(value)
+
+
+def _public_account(payload: object) -> AccountCheckInResult | None:
+	"""只从批次 artifact 中提取允许公开聚合的账号字段。"""
+	if not isinstance(payload, dict):
+		return None
+
+	raw_status = payload.get('status')
+	status = cast('CheckInStatus', raw_status) if raw_status in {'pending', 'success', 'failure'} else 'pending'
+	name = payload.get('name')
+	provider = payload.get('provider')
+	reason = payload.get('reason')
+	return AccountCheckInResult(
+		name=name if isinstance(name, str) and name else '未命名账号',
+		provider=provider if isinstance(provider, str) and provider else '未知',
+		status=status,
+		balance=_public_money(payload.get('balance')),
+		used=_public_money(payload.get('used')),
+		reason=reason if isinstance(reason, str) and reason else None,
+	)
+
+
+def _batch_info_from_payload(payload: object, expected_batches: int) -> BatchRunInfo | None:
+	if not isinstance(payload, dict):
+		return None
+
+	index = _strict_int(payload.get('index'))
+	count = _strict_int(payload.get('count'))
+	total_accounts = _strict_int(payload.get('total_accounts'))
+	account_start = _strict_int(payload.get('account_start'))
+	account_end = _strict_int(payload.get('account_end'))
+	account_count = _strict_int(payload.get('account_count'))
+	if (
+		index is None
+		or count != expected_batches
+		or total_accounts is None
+		or account_start is None
+		or account_end is None
+		or account_count is None
+		or index < 0
+		or index >= expected_batches
+		or total_accounts < 0
+		or account_start < 0
+		or account_end < 0
+		or account_count < 0
+	):
+		return None
+
+	fingerprint = payload.get('egress_fingerprint')
+	if not isinstance(fingerprint, str) or not fingerprint.strip():
+		fingerprint = None
+	else:
+		fingerprint = fingerprint.strip()[:64]
+
+	return BatchRunInfo(
+		index=index,
+		count=count,
+		total_accounts=total_accounts,
+		account_start=account_start,
+		account_end=account_end,
+		account_count=account_count,
+		egress_fingerprint=fingerprint,
+	)
+
+
+def merge_check_in_reports(
+	reports: list[dict[str, Any]],
+	*,
+	expected_batches: int,
+) -> CheckInRunReport:
+	"""合并 matrix 批次结果，并显式标记缺失、重复或不完整的批次。"""
+	if expected_batches < 1:
+		raise ValueError('expected_batches 必须大于等于 1')
+
+	reports_by_batch: dict[int, tuple[dict[str, Any], BatchRunInfo]] = {}
+	errors: list[str] = []
+	for report in reports:
+		batch = _batch_info_from_payload(report.get('batch'), expected_batches)
+		if batch is None:
+			errors.append('发现缺少有效批次元数据的结果')
+			continue
+		if batch.index in reports_by_batch:
+			errors.append(f'批次 {batch.index + 1} 结果重复')
+			continue
+		reports_by_batch[batch.index] = (report, batch)
+
+	missing_batches = [index + 1 for index in range(expected_batches) if index not in reports_by_batch]
+	if missing_batches:
+		errors.append(f'缺少批次：{", ".join(map(str, missing_batches))}')
+
+	accounts: list[AccountCheckInResult] = []
+	batches: list[BatchRunInfo] = []
+	started_at_values: list[str] = []
+	finished_at_values: list[str] = []
+	total_account_values: set[int] = set()
+
+	for index in sorted(reports_by_batch):
+		report, batch = reports_by_batch[index]
+		batches.append(batch)
+		total_account_values.add(batch.total_accounts)
+
+		started_at = report.get('started_at')
+		if isinstance(started_at, str) and started_at:
+			started_at_values.append(started_at)
+		finished_at = report.get('finished_at')
+		if isinstance(finished_at, str) and finished_at:
+			finished_at_values.append(finished_at)
+		else:
+			errors.append(f'批次 {index + 1} 未正常完成')
+
+		raw_accounts = report.get('accounts')
+		if not isinstance(raw_accounts, list):
+			errors.append(f'批次 {index + 1} 缺少账号列表')
+			continue
+
+		public_accounts = [account for item in raw_accounts if (account := _public_account(item)) is not None]
+		if len(public_accounts) != len(raw_accounts):
+			errors.append(f'批次 {index + 1} 包含无效账号结果')
+		if len(public_accounts) != batch.account_count:
+			errors.append(f'批次 {index + 1} 账号数量不符：期望 {batch.account_count}，实际 {len(public_accounts)}')
+		accounts.extend(public_accounts)
+
+		report_error = report.get('error')
+		if isinstance(report_error, str) and report_error:
+			errors.append(f'批次 {index + 1}：{report_error}')
+
+	if len(total_account_values) > 1:
+		errors.append('各批次记录的总账号数不一致')
+	expected_total = next(iter(total_account_values), 0)
+	if len(accounts) != expected_total:
+		errors.append(f'合并账号数量不符：期望 {expected_total}，实际 {len(accounts)}')
+
+	unique_errors = list(dict.fromkeys(errors))
+	return CheckInRunReport(
+		started_at=min(started_at_values) if started_at_values else '',
+		finished_at=max(finished_at_values) if len(finished_at_values) == expected_batches else None,
+		accounts=accounts,
+		error='；'.join(unique_errors) if unique_errors else None,
+		batches=batches,
+	)
 
 
 def _escape_table_cell(value: object) -> str:
@@ -175,6 +346,59 @@ def render_github_summary(report: dict[str, Any] | None, *, step_outcome: str | 
 			)
 	else:
 		lines.extend(['> 没有可展示的账号结果。', ''])
+
+	batches = report.get('batches')
+	if isinstance(batches, list) and batches:
+		lines.extend(
+			[
+				'',
+				'## Runner 出口诊断',
+				'',
+				'| 批次 | 账号范围 | 账号数 | 出口 IP 指纹 |',
+				'|:--:|:--:|--:|:--|',
+			]
+		)
+		fingerprints: list[str] = []
+		for batch in batches:
+			if not isinstance(batch, dict):
+				continue
+			index = batch.get('index')
+			batch_number = index + 1 if isinstance(index, int) and not isinstance(index, bool) else '未知'
+			account_start = batch.get('account_start')
+			account_end = batch.get('account_end')
+			account_range = (
+				f'{account_start}–{account_end}'
+				if isinstance(account_start, int)
+				and not isinstance(account_start, bool)
+				and isinstance(account_end, int)
+				and not isinstance(account_end, bool)
+				else '未知'
+			)
+			account_count = batch.get('account_count')
+			account_count_label = (
+				str(account_count) if isinstance(account_count, int) and not isinstance(account_count, bool) else '未知'
+			)
+			fingerprint = batch.get('egress_fingerprint')
+			fingerprint_label = fingerprint if isinstance(fingerprint, str) and fingerprint else '未获取'
+			if fingerprint_label != '未获取':
+				fingerprints.append(fingerprint_label)
+			lines.append(
+				'| '
+				f'{_escape_table_cell(batch_number)} | '
+				f'{_escape_table_cell(account_range)} | '
+				f'{_escape_table_cell(account_count_label)} | '
+				f'{_escape_table_cell(fingerprint_label)} |'
+			)
+
+		lines.append('')
+		if len(fingerprints) == len(batches) and len(set(fingerprints)) == len(fingerprints):
+			lines.append('> ✅ 各批次出口 IP 指纹不同，说明本次 matrix jobs 实际使用了不同公网出口。')
+		elif len(fingerprints) == len(batches):
+			lines.append('> ⚠️ 至少两个批次的出口 IP 指纹相同，GitHub 未为所有 jobs 提供不同公网出口。')
+		else:
+			lines.append('> ⚪ 部分批次未获取出口 IP 指纹，无法完整比较公网出口。')
+		lines.append('')
+		lines.append('> 指纹仅用于同一次运行内比较，不包含原始公网 IP。')
 
 	error = report.get('error')
 	if isinstance(error, str) and error:

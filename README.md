@@ -123,6 +123,13 @@
 
 > 运行摘要只使用账号的 `name` 显示名称、脱敏失败分类和公开结果字段，不会写入邮箱、密码、Cookie 或 API User。
 
+GitHub Actions 默认把账号按原顺序尽量平均地切成三个连续批次；当前 11 个账号对应 `4 / 4 / 3`，
+并使用三个独立 matrix jobs 依次处理。每个 job 都会由 GitHub 创建新的 Runner VM；最终汇总 job
+下载三个批次的公开结果并生成一张完整 Summary。Summary 还会显示每个 Runner 的出口 IP 指纹哈希，
+用于判断三个 jobs 是否实际获得不同公网出口，但不会公开原始 IP。
+
+> GitHub 只保证不同 jobs 使用独立 Runner，不保证公网出口 IP 必然不同；出口指纹才是每次运行的实际证据。
+
 邮箱密码登录会按 `provider + email` 的不可逆摘要复用浏览器 Profile，因此修改账号的 `name`
 不会丢失已缓存的登录状态。GitHub Actions 每次运行都会恢复最近的 Profile，并在运行结束后用新缓存键
 保存更新后的状态，避免固定缓存键命中后无法写回。
@@ -312,11 +319,25 @@
 
 - `PROXY_SUBSCRIPTION_URL`：Clash/Mihomo 订阅链接。设置后，workflow 会运行 `scripts/setup_mihomo_proxy.sh`，启动本地代理并写入 `CHECKIN_PROXY_URL`。
 
+订阅 URL 通常包含访问 token，不要写入仓库、Issue、Actions 普通变量或聊天记录。Clash Verge
+兼容链接只有在返回内容可作为 Clash/Mihomo `proxy-provider`（包含有效 `proxies` 列表）时才能被
+现有脚本直接使用；若机场根据 User-Agent 返回 Base64 URI 列表或仅返回完整客户端配置，需要使用机场
+提供的 Clash/Mihomo 订阅入口。
+
+如需让内置 `anyrouter` 也使用代理，必须同时覆盖它的 provider 配置：
+
+```json
+{"anyrouter":{"domain":"https://anyrouter.top","use_proxy":true}}
+```
+
+当前 Mihomo 配置使用 `url-test` 自动选择延迟最低的节点。三个 batch jobs 可能选到同一个代理节点；
+如果目标是强制三个批次使用三个不同代理出口，还需要增加按 `batch_index` 固定选择不同节点的逻辑。
+
 本地运行时也可以直接使用已有代理：
 
 ```bash
 CHECKIN_PROXY_URL=http://127.0.0.1:7890
-PROVIDERS={"agentrouter":{"use_proxy":true}}
+PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
 ```
 
 如果使用订阅脚本，默认会用 `https://www.google.com/generate_204` 测试代理连通性；也可以通过 `PROXY_TEST_URL` 覆盖。

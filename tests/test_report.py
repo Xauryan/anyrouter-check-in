@@ -9,8 +9,11 @@ import checkin
 from utils.config import AccountConfig, AppConfig
 from utils.report import (
 	AccountCheckInResult,
+	BatchRunInfo,
 	CheckInRunReport,
+	CheckInStatus,
 	load_check_in_report,
+	merge_check_in_reports,
 	render_github_summary,
 	save_check_in_report,
 )
@@ -136,6 +139,134 @@ def test_render_script_appends_summary_file(tmp_path):
 	assert '- 签到步骤：✅ 成功' in summary
 
 
+def _batch_report(
+	*,
+	index: int,
+	account_start: int,
+	names: list[str],
+	fingerprint: str,
+	status: CheckInStatus = 'success',
+) -> CheckInRunReport:
+	return CheckInRunReport(
+		started_at=f'2026-07-30T08:0{index}:00+00:00',
+		finished_at=f'2026-07-30T08:1{index}:00+00:00',
+		accounts=[
+			AccountCheckInResult(
+				name=name,
+				provider='anyrouter',
+				status=status,
+				balance=100.0 if status == 'success' else None,
+				used=20.0 if status == 'success' else None,
+				reason=None if status == 'success' else '登录验证失败（已重试）',
+			)
+			for name in names
+		],
+		batch=BatchRunInfo(
+			index=index,
+			count=3,
+			total_accounts=5,
+			account_start=account_start,
+			account_end=account_start + len(names) - 1,
+			account_count=len(names),
+			egress_fingerprint=fingerprint,
+		),
+	)
+
+
+def test_merge_check_in_reports_preserves_order_and_runner_fingerprints():
+	reports = [
+		_batch_report(index=2, account_start=5, names=['账号 5'], fingerprint='cccccccccccc').to_dict(),
+		_batch_report(
+			index=0,
+			account_start=1,
+			names=['账号 1', '账号 2'],
+			fingerprint='aaaaaaaaaaaa',
+		).to_dict(),
+		_batch_report(
+			index=1,
+			account_start=3,
+			names=['账号 3', '账号 4'],
+			fingerprint='bbbbbbbbbbbb',
+			status='failure',
+		).to_dict(),
+	]
+
+	merged = merge_check_in_reports(reports, expected_batches=3)
+	payload = merged.to_dict()
+	summary = render_github_summary(payload, step_outcome='success')
+
+	assert [account['name'] for account in payload['accounts']] == [
+		'账号 1',
+		'账号 2',
+		'账号 3',
+		'账号 4',
+		'账号 5',
+	]
+	assert payload['success_count'] == 3
+	assert payload['failure_count'] == 2
+	assert payload['pending_count'] == 0
+	assert payload['error'] is None
+	assert [batch['index'] for batch in payload['batches']] == [0, 1, 2]
+	assert '| 1 | 1–2 | 2 | aaaaaaaaaaaa |' in summary
+	assert '| 2 | 3–4 | 2 | bbbbbbbbbbbb |' in summary
+	assert '| 3 | 5–5 | 1 | cccccccccccc |' in summary
+	assert '各批次出口 IP 指纹不同' in summary
+
+
+def test_merge_check_in_reports_marks_missing_batch_incomplete():
+	reports = [
+		_batch_report(index=0, account_start=1, names=['账号 1', '账号 2'], fingerprint='same').to_dict(),
+		_batch_report(index=2, account_start=5, names=['账号 5'], fingerprint='same').to_dict(),
+	]
+
+	merged = merge_check_in_reports(reports, expected_batches=3)
+
+	assert merged.finished_at is None
+	assert merged.error is not None
+	assert '缺少批次：2' in merged.error
+	assert '合并账号数量不符：期望 5，实际 3' in merged.error
+
+
+def test_merge_script_writes_combined_report_and_github_outputs(tmp_path):
+	input_dir = tmp_path / 'downloaded'
+	for batch in [
+		_batch_report(index=0, account_start=1, names=['账号 1', '账号 2'], fingerprint='aaaaaaaaaaaa'),
+		_batch_report(index=1, account_start=3, names=['账号 3', '账号 4'], fingerprint='bbbbbbbbbbbb'),
+		_batch_report(index=2, account_start=5, names=['账号 5'], fingerprint='cccccccccccc'),
+	]:
+		assert batch.batch is not None
+		batch_dir = input_dir / f'batch-{batch.batch.index}'
+		save_check_in_report(batch, str(batch_dir / 'checkin_results.json'))
+
+	merged_path = tmp_path / 'merged.json'
+	github_output = tmp_path / 'github-output.txt'
+	project_root = Path(__file__).parent.parent
+	subprocess.run(
+		[
+			sys.executable,
+			str(project_root / 'scripts' / 'merge_checkin_reports.py'),
+			'--input-dir',
+			str(input_dir),
+			'--output',
+			str(merged_path),
+			'--expected-batches',
+			'3',
+			'--github-output',
+			str(github_output),
+		],
+		check=True,
+		cwd=project_root,
+	)
+
+	payload = load_check_in_report(merged_path)
+	assert payload['success_count'] == 5
+	assert github_output.read_text(encoding='utf-8').splitlines() == [
+		'success_count=5',
+		'complete=true',
+		'step_outcome=success',
+	]
+
+
 @pytest.mark.asyncio
 async def test_main_persists_each_account_result_without_credentials(monkeypatch, tmp_path):
 	report_path = tmp_path / 'checkin-results.json'
@@ -168,6 +299,9 @@ async def test_main_persists_each_account_result_without_credentials(monkeypatch
 
 	app_config = AppConfig(providers={})
 	monkeypatch.setenv('CHECKIN_RESULTS_FILE', str(report_path))
+	monkeypatch.delenv('CHECKIN_BATCH_INDEX', raising=False)
+	monkeypatch.delenv('CHECKIN_BATCH_COUNT', raising=False)
+	monkeypatch.delenv('CHECKIN_EGRESS_FINGERPRINT', raising=False)
 	monkeypatch.delenv('DEBUG_MODE', raising=False)
 	monkeypatch.setattr(checkin.AppConfig, 'load_from_env', classmethod(lambda cls: app_config))
 	monkeypatch.setattr(checkin, 'load_accounts_config', lambda: accounts)
@@ -184,6 +318,15 @@ async def test_main_persists_each_account_result_without_credentials(monkeypatch
 	assert payload['finished_at']
 	assert payload['success_count'] == 1
 	assert payload['failure_count'] == 1
+	assert payload['batch'] == {
+		'index': 0,
+		'count': 1,
+		'total_accounts': 2,
+		'account_start': 1,
+		'account_end': 2,
+		'account_count': 2,
+		'egress_fingerprint': None,
+	}
 	assert payload['accounts'] == [
 		{
 			'name': '成功账号',
@@ -199,7 +342,7 @@ async def test_main_persists_each_account_result_without_credentials(monkeypatch
 			'status': 'failure',
 			'balance': None,
 			'used': None,
-			'reason': '登录或用户信息获取失败（已重试）',
+			'reason': '登录验证失败（已重试）',
 		},
 	]
 

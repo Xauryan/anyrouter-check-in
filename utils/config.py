@@ -187,6 +187,56 @@ class AccountConfig:
 		return self.name if self.name else f'Account {index + 1}'
 
 
+@dataclass(frozen=True)
+class AccountBatchSelection:
+	"""当前 Runner 负责的连续账号批次。"""
+
+	accounts: list[AccountConfig]
+	batch_index: int
+	batch_count: int
+	total_accounts: int
+	start_index: int
+	end_index: int
+
+
+def select_account_batch(
+	accounts: list[AccountConfig],
+	batch_index: int,
+	batch_count: int,
+) -> AccountBatchSelection:
+	"""把账号尽量平均地切成连续批次，前面的批次至多多一个账号。"""
+	if batch_count < 1:
+		raise ValueError('CHECKIN_BATCH_COUNT 必须大于等于 1')
+	if batch_index < 0 or batch_index >= batch_count:
+		raise ValueError('CHECKIN_BATCH_INDEX 必须位于 0 到 CHECKIN_BATCH_COUNT - 1')
+
+	total_accounts = len(accounts)
+	base_size, remainder = divmod(total_accounts, batch_count)
+	batch_size = base_size + (1 if batch_index < remainder else 0)
+	start_index = batch_index * base_size + min(batch_index, remainder)
+	end_index = start_index + batch_size
+
+	return AccountBatchSelection(
+		accounts=accounts[start_index:end_index],
+		batch_index=batch_index,
+		batch_count=batch_count,
+		total_accounts=total_accounts,
+		start_index=start_index,
+		end_index=end_index,
+	)
+
+
+def select_account_batch_from_env(accounts: list[AccountConfig]) -> AccountBatchSelection:
+	"""读取 GitHub Actions 批次变量；本地运行默认仍处理全部账号。"""
+	try:
+		batch_index = int(os.getenv('CHECKIN_BATCH_INDEX', '0'))
+		batch_count = int(os.getenv('CHECKIN_BATCH_COUNT', '1'))
+	except ValueError as exc:
+		raise ValueError('CHECKIN_BATCH_INDEX 和 CHECKIN_BATCH_COUNT 必须是整数') from exc
+
+	return select_account_batch(accounts, batch_index, batch_count)
+
+
 def load_accounts_config() -> list[AccountConfig] | None:
 	"""从环境变量加载账号配置"""
 	accounts_str = os.getenv('ANYROUTER_ACCOUNTS')

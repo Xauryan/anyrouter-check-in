@@ -12,12 +12,27 @@ on:
 
 jobs:
   checkin:
+    name: 签到批次 ${{ matrix.batch_number }} / 3
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - batch_index: 0
+            batch_number: 1
+          - batch_index: 1
+            batch_number: 2
+          - batch_index: 2
+            batch_number: 3
     runs-on: ubuntu-latest
     environment: production
     env:
       PYTHONIOENCODING: utf-8
       PYTHONUNBUFFERED: 1
-      CHECKIN_RESULTS_FILE: checkin_results.json
+      CHECKIN_RESULTS_FILE: batch_results/checkin_results.json
+      CHECKIN_BATCH_INDEX: ${{ matrix.batch_index }}
+      CHECKIN_BATCH_COUNT: 3
+      CHECKIN_SCREENSHOT_ARTIFACT: checkin-screenshots-${{ github.run_id }}-batch-${{ matrix.batch_number }}
       DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' && 'true' || 'false' }}
     steps:
     - uses: actions/checkout@v6
@@ -64,23 +79,35 @@ jobs:
         uv run python -m cloakbrowser install
         echo "✅ CloakBrowser 安装完成"
 
-    - name: 恢复余额历史缓存
+    - name: 恢复批次余额历史缓存
       uses: actions/cache@v5
       with:
         path: balance_hash.txt
-        key: balance-hash-${{ github.ref_name }}-${{ github.run_id }}
+        key: balance-hash-${{ github.ref_name }}-v2-batch-${{ matrix.batch_index }}-${{ github.run_id }}
         restore-keys: |
-          balance-hash-${{ github.ref_name }}-
-          balance-hash-
+          balance-hash-${{ github.ref_name }}-v2-batch-${{ matrix.batch_index }}-
 
-    - name: 恢复浏览器 Profile 缓存
+    - name: 恢复批次浏览器 Profile 缓存
       uses: actions/cache@v5
       with:
         path: .browser_profiles
-        key: browser-profiles-${{ runner.os }}-v2-${{ github.run_id }}
+        key: browser-profiles-${{ runner.os }}-v3-batch-${{ matrix.batch_index }}-${{ github.run_id }}
         restore-keys: |
+          browser-profiles-${{ runner.os }}-v3-batch-${{ matrix.batch_index }}-
           browser-profiles-${{ runner.os }}-v2-
           browser-profiles-${{ runner.os }}-v1
+
+    - name: 记录 Runner 出口指纹
+      shell: bash
+      run: |
+        runner_ip="$(curl --retry 2 --retry-delay 2 --max-time 10 -fsS https://api.ipify.org || true)"
+        if [[ "${runner_ip}" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+          fingerprint="$(printf '%s:%s' "${GITHUB_RUN_ID}" "${runner_ip}" | sha256sum | cut -c1-12)"
+        else
+          fingerprint="unavailable"
+        fi
+        echo "CHECKIN_EGRESS_FINGERPRINT=${fingerprint}" >> "${GITHUB_ENV}"
+        echo "Batch ${{ matrix.batch_number }} Runner egress fingerprint: ${fingerprint}"
 
     - name: 配置代理
       env:
@@ -90,8 +117,9 @@ jobs:
         PROXY_REQUIRED: false
       run: bash scripts/setup_mihomo_proxy.sh
 
-    - name: 执行签到
+    - name: 执行批次签到
       id: checkin
+      continue-on-error: true
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
         CHECKIN_HEADLESS: false
@@ -125,14 +153,23 @@ jobs:
       run: |
         xvfb-run -a --server-args="-screen 0 1920x1080x24" uv run checkin.py
 
-    - name: 上传调试截图
+    - name: 上传批次结果
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: checkin-result-${{ github.run_id }}-batch-${{ matrix.batch_index }}
+        path: ${{ env.CHECKIN_RESULTS_FILE }}
+        if-no-files-found: error
+        retention-days: 14
+
+    - name: 上传批次调试截图
       if: always() && env.DEBUG_MODE == 'true'
       env:
         HTTP_PROXY: ''
         HTTPS_PROXY: ''
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
-        name: checkin-screenshots-${{ github.run_id }}
+        name: ${{ env.CHECKIN_SCREENSHOT_ARTIFACT }}
         path: checkin_screenshots/
         if-no-files-found: warn
         include-hidden-files: true
@@ -142,17 +179,65 @@ jobs:
       if: always()
       run: bash scripts/stop_mihomo_proxy.sh
 
-    - name: 发布签到结果摘要
+  summary:
+    name: 汇总签到结果
+    if: always()
+    needs: checkin
+    runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUNBUFFERED: 1
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: 下载全部批次结果
+      continue-on-error: true
+      uses: actions/download-artifact@v8
+      with:
+        pattern: checkin-result-${{ github.run_id }}-batch-*
+        path: batch_results
+        merge-multiple: false
+
+    - name: 合并批次结果
+      id: merge
+      run: |
+        python3 scripts/merge_checkin_reports.py \
+          --input-dir batch_results \
+          --output checkin_results.json \
+          --expected-batches 3 \
+          --github-output "${GITHUB_OUTPUT}"
+
+    - name: 上传合并结果
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: checkin-results-${{ github.run_id }}
+        path: checkin_results.json
+        if-no-files-found: error
+        retention-days: 14
+
+    - name: 发布合并结果摘要
       if: always()
       env:
-        CHECKIN_STEP_OUTCOME: ${{ steps.checkin.outcome }}
+        CHECKIN_STEP_OUTCOME: ${{ steps.merge.outputs.step_outcome }}
       run: |
         python3 scripts/render_checkin_summary.py \
-          --input "$CHECKIN_RESULTS_FILE" \
-          --output "$GITHUB_STEP_SUMMARY" \
-          --step-outcome "$CHECKIN_STEP_OUTCOME"
-        echo "签到结果已发布到 GitHub Actions Summary"
-        if [ "${DEBUG_MODE}" = "true" ] && [ -d checkin_screenshots ] && [ "$(ls -A checkin_screenshots 2>/dev/null)" ]; then
-          echo "调试截图已上传为 artifact: checkin-screenshots-${{ github.run_id }}"
-          ls -la checkin_screenshots/
+          --input checkin_results.json \
+          --output "${GITHUB_STEP_SUMMARY}" \
+          --step-outcome "${CHECKIN_STEP_OUTCOME}"
+        echo "三个批次的合并结果已发布到 GitHub Actions Summary"
+
+    - name: 校验整体签到结果
+      if: always()
+      env:
+        CHECKIN_COMPLETE: ${{ steps.merge.outputs.complete }}
+        CHECKIN_SUCCESS_COUNT: ${{ steps.merge.outputs.success_count }}
+      run: |
+        if [[ "${CHECKIN_COMPLETE}" != "true" ]]; then
+          echo "::error::批次结果缺失或不完整"
+          exit 1
+        fi
+        if [[ "${CHECKIN_SUCCESS_COUNT}" == "0" ]]; then
+          echo "::error::所有账号签到均失败"
+          exit 1
         fi
