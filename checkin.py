@@ -38,6 +38,7 @@ from utils.debug import debug_print, is_debug_enabled
 from utils.host_fallback import HostFallbackClient, browser_host_resolver_args, is_browser_connection_failure
 from utils.notify import notify
 from utils.proxy import get_playwright_proxy, get_proxy_server
+from utils.report import AccountCheckInResult, CheckInRunReport, save_check_in_report
 
 load_dotenv()
 
@@ -522,6 +523,9 @@ def run_check_in_requests(
 
 async def main():
 	"""主函数"""
+	report = CheckInRunReport(started_at=datetime.now().astimezone().isoformat(timespec='seconds'))
+	save_check_in_report(report)
+
 	if is_debug_enabled():
 		print('[INFO] DEBUG_MODE enabled')
 		proxy_server = os.getenv('CHECKIN_PROXY_URL', '').strip()
@@ -545,10 +549,21 @@ async def main():
 	if not accounts:
 		error_msg = '[FAILED] Unable to load account configuration, program exits'
 		print(error_msg)
+		report.error = '无法加载账号配置，未执行签到'
+		report.finished_at = datetime.now().astimezone().isoformat(timespec='seconds')
+		save_check_in_report(report)
 		notify.push_message('AnyRouter Check-in Alert', error_msg, msg_type='text')
 		sys.exit(1)
 
 	print(f'[INFO] Found {len(accounts)} account configurations')
+	report.accounts = [
+		AccountCheckInResult(
+			name=account.get_display_name(i),
+			provider=account.provider,
+		)
+		for i, account in enumerate(accounts)
+	]
+	save_check_in_report(report)
 
 	last_balance_hash = load_balance_hash()
 
@@ -564,6 +579,7 @@ async def main():
 		account_key = f'account_{i + 1}'
 		try:
 			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			report.accounts[i].status = 'success' if success else 'failure'
 			if success:
 				success_count += 1
 
@@ -579,6 +595,8 @@ async def main():
 				current_quota = user_info_after['quota']
 				current_used = user_info_after['used_quota']
 				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
+				report.accounts[i].balance = current_quota
+				report.accounts[i].used = current_used
 
 				if user_info_before and user_info_before.get('success'):
 					before_quota = user_info_before['quota']
@@ -618,9 +636,14 @@ async def main():
 		except Exception as e:
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
+			report.accounts[i].status = 'failure'
 			need_notify = True
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
+		finally:
+			save_check_in_report(report)
 
+	report.finished_at = datetime.now().astimezone().isoformat(timespec='seconds')
+	save_check_in_report(report)
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:
 		if last_balance_hash is None:

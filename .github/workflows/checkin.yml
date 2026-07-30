@@ -17,6 +17,7 @@ jobs:
     env:
       PYTHONIOENCODING: utf-8
       PYTHONUNBUFFERED: 1
+      CHECKIN_RESULTS_FILE: checkin_results.json
       DEBUG_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.debug == 'true' && 'true' || 'false' }}
     steps:
     - uses: actions/checkout@v6
@@ -89,6 +90,7 @@ jobs:
       run: bash scripts/setup_mihomo_proxy.sh
 
     - name: 执行签到
+      id: checkin
       env:
         DEBUG_MODE: ${{ env.DEBUG_MODE }}
         CHECKIN_HEADLESS: false
@@ -133,11 +135,16 @@ jobs:
       if: always()
       run: bash scripts/stop_mihomo_proxy.sh
 
-    - name: 执行结果
+    - name: 发布签到结果摘要
       if: always()
+      env:
+        CHECKIN_STEP_OUTCOME: ${{ steps.checkin.outcome }}
       run: |
-        echo "签到任务执行完成"
-        echo "时间: $(date)"
+        python3 scripts/render_checkin_summary.py \
+          --input "$CHECKIN_RESULTS_FILE" \
+          --output "$GITHUB_STEP_SUMMARY" \
+          --step-outcome "$CHECKIN_STEP_OUTCOME"
+        echo "签到结果已发布到 GitHub Actions Summary"
         if [ "${DEBUG_MODE}" = "true" ] && [ -d checkin_screenshots ] && [ "$(ls -A checkin_screenshots 2>/dev/null)" ]; then
           echo "调试截图已上传为 artifact: checkin-screenshots-${{ github.run_id }}"
           ls -la checkin_screenshots/

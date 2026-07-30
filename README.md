@@ -21,6 +21,7 @@
 - ✅ 单个/多账号自动签到
 - ✅ 多种机器人通知（可选）
 - ✅ 绕过 WAF 限制
+- ✅ GitHub Actions 运行摘要（逐账号展示签到状态与余额）
 
 ## 使用方法
 
@@ -116,8 +117,11 @@
 1. 在 "Actions" 选项卡中，点击 "AnyRouter 自动签到"
 2. 点击 "Run workflow" 按钮
 3. 确认运行
+4. 运行结束后，在该次 workflow run 的 Summary 页面查看每个账号的签到状态、当前余额和累计消耗
 
 ![运行结果](./assets/check-in.png)
+
+> 运行摘要只使用账号的 `name` 显示名称和公开结果字段，不会写入邮箱、密码、Cookie 或 API User。
 
 ## 执行时间
 
