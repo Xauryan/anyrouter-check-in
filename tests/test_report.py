@@ -29,7 +29,12 @@ def test_report_contains_public_results_and_statistics_only(tmp_path):
 				balance=125.5,
 				used=20.25,
 			),
-			AccountCheckInResult(name='备用账号', provider='agentrouter', status='failure'),
+			AccountCheckInResult(
+				name='备用账号',
+				provider='agentrouter',
+				status='failure',
+				reason='登录或用户信息获取失败（已重试）',
+			),
 		],
 	)
 
@@ -45,8 +50,9 @@ def test_report_contains_public_results_and_statistics_only(tmp_path):
 		'status': 'success',
 		'balance': 125.5,
 		'used': 20.25,
+		'reason': None,
 	}
-	assert set(payload['accounts'][0]) == {'name', 'provider', 'status', 'balance', 'used'}
+	assert set(payload['accounts'][0]) == {'name', 'provider', 'status', 'balance', 'used', 'reason'}
 
 
 def test_render_github_summary_shows_every_account_and_escapes_names():
@@ -61,7 +67,12 @@ def test_render_github_summary_shows_every_account_and_escapes_names():
 				balance=2120.934,
 				used=1104.066,
 			),
-			AccountCheckInResult(name='backup', provider='agentrouter', status='failure'),
+			AccountCheckInResult(
+				name='backup',
+				provider='agentrouter',
+				status='failure',
+				reason='登录失败 | <重试>',
+			),
 			AccountCheckInResult(name='waiting', provider='custom', status='pending'),
 		],
 	)
@@ -71,8 +82,8 @@ def test_render_github_summary_shows_every_account_and_escapes_names():
 	assert '# AnyRouter 签到结果' in summary
 	assert '✅ **1** 成功 / ❌ **1** 失败 / ⚪ **1** 未完成' in summary
 	assert 'main&#124;&lt;admin&gt;' in summary
-	assert '| backup | agentrouter | ❌ 失败 | 未获取 | 未获取 |' in summary
-	assert '| waiting | custom | ⚪ 未完成 | 未获取 | 未获取 |' in summary
+	assert '| backup | agentrouter | ❌ 失败 | 未获取 | 未获取 | 登录失败 &#124; &lt;重试&gt; |' in summary
+	assert '| waiting | custom | ⚪ 未完成 | 未获取 | 未获取 | — |' in summary
 	assert '$2,120.93' in summary
 	assert '$1,104.07' in summary
 	assert '- 签到步骤：✅ 成功' in summary
@@ -121,7 +132,7 @@ def test_render_script_appends_summary_file(tmp_path):
 	)
 
 	summary = summary_path.read_text(encoding='utf-8')
-	assert '| 账号 1 | anyrouter | ✅ 成功 | $25.00 | $5.00 |' in summary
+	assert '| 账号 1 | anyrouter | ✅ 成功 | $25.00 | $5.00 | — |' in summary
 	assert '- 签到步骤：✅ 成功' in summary
 
 
@@ -180,6 +191,7 @@ async def test_main_persists_each_account_result_without_credentials(monkeypatch
 			'status': 'success',
 			'balance': 125.0,
 			'used': 20.0,
+			'reason': None,
 		},
 		{
 			'name': '失败账号',
@@ -187,6 +199,7 @@ async def test_main_persists_each_account_result_without_credentials(monkeypatch
 			'status': 'failure',
 			'balance': None,
 			'used': None,
+			'reason': '登录或用户信息获取失败（已重试）',
 		},
 	]
 

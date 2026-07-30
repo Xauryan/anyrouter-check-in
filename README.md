@@ -121,7 +121,28 @@
 
 ![运行结果](./assets/check-in.png)
 
-> 运行摘要只使用账号的 `name` 显示名称和公开结果字段，不会写入邮箱、密码、Cookie 或 API User。
+> 运行摘要只使用账号的 `name` 显示名称、脱敏失败分类和公开结果字段，不会写入邮箱、密码、Cookie 或 API User。
+
+邮箱密码登录会按 `provider + email` 的不可逆摘要复用浏览器 Profile，因此修改账号的 `name`
+不会丢失已缓存的登录状态。GitHub Actions 每次运行都会恢复最近的 Profile，并在运行结束后用新缓存键
+保存更新后的状态，避免固定缓存键命中后无法写回。
+
+遇到短暂的页面、WAF 或接口抖动时，脚本会分层处理：
+
+- 登录表单提交后等待 URL 或 session Cookie；没有建立会话时，清理 Cookie 后完整重试登录
+- 到达控制台但未取得 `/api/user/self` 时，刷新控制台一次并主动重试用户信息接口
+- 多账号之间增加间隔，单账号失败后增加冷却时间，降低连续登录触发风控的概率
+
+相关参数可通过环境变量调整：
+
+| 环境变量 | GitHub Actions 默认值 | 作用 |
+|:--|--:|:--|
+| `CHECKIN_LOGIN_MAX_ATTEMPTS` | `2` | 每个账号完整浏览器登录次数 |
+| `CHECKIN_LOGIN_RETRY_DELAY_SECONDS` | `15` | 两次完整登录之间的基础等待秒数 |
+| `CHECKIN_USER_INFO_MAX_ATTEMPTS` | `3` | 登录后主动查询用户信息的最大次数 |
+| `CHECKIN_USER_INFO_RETRY_DELAY_SECONDS` | `3` | 用户信息查询的递增等待基数 |
+| `CHECKIN_ACCOUNT_DELAY_SECONDS` | `5` | 成功账号与下一个账号之间的等待 |
+| `CHECKIN_FAILURE_COOLDOWN_SECONDS` | `30` | 失败账号与下一个账号之间的冷却 |
 
 ## 执行时间
 
@@ -362,7 +383,7 @@ PROVIDERS={"agentrouter":{"use_proxy":true}}
 2. cookies 是否过期
 3. API User 是否正确
 4. 网站是否更改了签到接口
-5. 查看 Actions 运行日志获取详细错误信息
+5. 查看 Actions Summary 的“说明”列和运行日志；登录重试仍失败时再下载调试截图 artifact
 
 ## 本地开发环境设置
 

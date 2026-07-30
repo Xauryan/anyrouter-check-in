@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 
 from utils.browser import (
 	BrowserLoginResult,
+	build_browser_profile_key,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
@@ -43,6 +44,27 @@ from utils.report import AccountCheckInResult, CheckInRunReport, save_check_in_r
 load_dotenv()
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+LOGIN_API_SUFFIX = '/api/user/login'
+DEFAULT_LOGIN_MAX_ATTEMPTS = 2
+DEFAULT_LOGIN_RETRY_DELAY_SECONDS = 15.0
+DEFAULT_ACCOUNT_DELAY_SECONDS = 0.0
+DEFAULT_FAILURE_COOLDOWN_SECONDS = 0.0
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 10) -> int:
+	try:
+		value = int(os.getenv(name, str(default)))
+	except ValueError:
+		return default
+	return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 300.0) -> float:
+	try:
+		value = float(os.getenv(name, str(default)))
+	except ValueError:
+		return default
+	return max(minimum, min(maximum, value))
 
 
 def load_balance_hash():
@@ -170,12 +192,20 @@ async def login_with_credentials(
 	print(f'[PROCESSING] {account_name}: Logging in with email/password...')
 
 	login_url = f'{provider_config.domain}{provider_config.login_path}'
+	profile_key = build_browser_profile_key(provider_name, email)
 	settings = load_browser_login_settings(
 		account_name,
 		provider_name,
 		persist_profile=provider_config.persist_profile,
+		profile_key=profile_key,
 	)
 	timeout_ms = settings.wait_timeout_ms
+	max_attempts = _env_int('CHECKIN_LOGIN_MAX_ATTEMPTS', DEFAULT_LOGIN_MAX_ATTEMPTS, maximum=5)
+	retry_delay = _env_float(
+		'CHECKIN_LOGIN_RETRY_DELAY_SECONDS',
+		DEFAULT_LOGIN_RETRY_DELAY_SECONDS,
+		maximum=120,
+	)
 
 	debug_print(
 		f'[INFO] {account_name}: Browser profile={settings.profile_dir}, '
@@ -188,23 +218,35 @@ async def login_with_credentials(
 		f'({provider_name})'
 	)
 
-	async def attempt_login(*, use_host_fallback: bool = False) -> BrowserLoginResult | None:
+	async def attempt_login(
+		*,
+		use_host_fallback: bool = False,
+		clear_cookies: bool = False,
+	) -> BrowserLoginResult | None:
 		if use_host_fallback:
 			print(f'[INFO] {account_name}: Browser hosts fallback enabled for login')
 
-		try:
-			context = await launch_login_context(
-				settings,
-				use_proxy=provider_config.use_proxy,
-				host_fallbacks=provider_config.host_fallbacks if use_host_fallback else None,
-			)
-		except Exception as e:
-			print(f'[FAILED] {account_name}: Browser launch failed: {e}')
-			return None
+		context = await launch_login_context(
+			settings,
+			use_proxy=provider_config.use_proxy,
+			host_fallbacks=provider_config.host_fallbacks if use_host_fallback else None,
+		)
 
 		page = None
+		login_response_status: int | None = None
+
+		def on_login_response(response) -> None:
+			nonlocal login_response_status
+			if LOGIN_API_SUFFIX in response.url:
+				login_response_status = response.status
+
 		try:
+			if clear_cookies:
+				await context.clear_cookies()
+				print(f'[INFO] {account_name}: Cleared browser cookies before full login retry')
+
 			page = await context.new_page()
+			page.on('response', on_login_response)
 			await prepare_browser_page(page)
 			await navigate_login_page(
 				page,
@@ -218,7 +260,7 @@ async def login_with_credentials(
 				if await has_session_cookie(page):
 					print(f'[WARN] {account_name}: Stale session cookie on login page, forcing email login')
 				await save_login_screenshot(page, provider_name, account_name, 'before-email-login')
-				await login_with_email_form(
+				login_established = await login_with_email_form(
 					page,
 					email,
 					password,
@@ -226,6 +268,15 @@ async def login_with_credentials(
 					provider=provider_name,
 					account_name=account_name,
 				)
+				if not login_established:
+					status_suffix = (
+						f' (login API HTTP {login_response_status})' if login_response_status is not None else ''
+					)
+					print(
+						f'[FAILED] {account_name}: Login form submitted but no session was established{status_suffix}'
+					)
+					await save_login_screenshot(page, provider_name, account_name, 'login-not-established')
+					return None
 			else:
 				print(f'[INFO] {account_name}: Browser profile already logged in')
 
@@ -249,10 +300,7 @@ async def login_with_credentials(
 					all_cookies[cookie_name] = cookie_value
 			api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
 
-			success_msg = f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies'
-			if is_debug_enabled() and api_user:
-				success_msg += f', api_user={api_user}'
-			print(success_msg)
+			print(f'[SUCCESS] {account_name}: Login successful, got {len(all_cookies)} cookies')
 			return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
 
 		except Exception:
@@ -260,20 +308,41 @@ async def login_with_credentials(
 				await save_login_screenshot(page, provider_name, account_name, 'login-error')
 			raise
 		finally:
+			if page is not None:
+				page.remove_listener('response', on_login_response)
 			await context.close()
 
-	try:
-		return await attempt_login()
-	except Exception as e:
-		if provider_config.host_fallbacks and is_browser_connection_failure(e):
-			print(f'[WARN] {account_name}: Browser login connection failed, retrying with hosts fallback: {e}')
-			try:
-				return await attempt_login(use_host_fallback=True)
-			except Exception as retry_error:
-				print(f'[FAILED] {account_name}: Error during login: {retry_error}')
-				return None
-		print(f'[FAILED] {account_name}: Error during login: {e}')
-		return None
+	for attempt in range(1, max_attempts + 1):
+		print(f'[INFO] {account_name}: Full browser login attempt {attempt}/{max_attempts}')
+		clear_cookies = attempt > 1
+		result: BrowserLoginResult | None = None
+		try:
+			result = await attempt_login(clear_cookies=clear_cookies)
+		except Exception as error:
+			if provider_config.host_fallbacks and is_browser_connection_failure(error):
+				print(f'[WARN] {account_name}: Browser login connection failed, retrying with hosts fallback: {error}')
+				try:
+					result = await attempt_login(
+						use_host_fallback=True,
+						clear_cookies=clear_cookies,
+					)
+				except Exception as retry_error:
+					print(f'[FAILED] {account_name}: Login attempt {attempt}/{max_attempts} failed: {retry_error}')
+			else:
+				print(f'[FAILED] {account_name}: Login attempt {attempt}/{max_attempts} failed: {error}')
+
+		if result:
+			return result
+		if attempt >= max_attempts:
+			break
+
+		delay = retry_delay * attempt
+		print(f'[WARN] {account_name}: Login was not verified; retrying from a fresh page in {delay:g}s')
+		if delay > 0:
+			await asyncio.sleep(delay)
+
+	print(f'[FAILED] {account_name}: Login not verified after {max_attempts} full attempt(s)')
+	return None
 
 
 def get_user_info(client, headers, user_info_url: str):
@@ -577,9 +646,22 @@ async def main():
 
 	for i, account in enumerate(accounts):
 		account_key = f'account_{i + 1}'
+		account_succeeded = False
 		try:
 			success, user_info_before, user_info_after = await check_in_account(account, i, app_config)
+			account_succeeded = success
 			report.accounts[i].status = 'success' if success else 'failure'
+			if success:
+				report.accounts[i].reason = None
+			elif not (
+				(user_info_before and user_info_before.get('success'))
+				or (user_info_after and user_info_after.get('success'))
+			):
+				report.accounts[i].reason = '登录或用户信息获取失败（已重试）'
+			elif user_info_after and user_info_after.get('success'):
+				report.accounts[i].reason = '签到接口返回失败'
+			else:
+				report.accounts[i].reason = '签到或余额查询失败'
 			if success:
 				success_count += 1
 
@@ -637,10 +719,20 @@ async def main():
 			account_name = account.get_display_name(i)
 			print(f'[FAILED] {account_name} processing exception: {e}')
 			report.accounts[i].status = 'failure'
+			report.accounts[i].reason = '账号处理异常'
 			need_notify = True
 			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
 		finally:
 			save_check_in_report(report)
+
+		if i < total_count - 1:
+			delay_name = 'CHECKIN_ACCOUNT_DELAY_SECONDS' if account_succeeded else 'CHECKIN_FAILURE_COOLDOWN_SECONDS'
+			default_delay = DEFAULT_ACCOUNT_DELAY_SECONDS if account_succeeded else DEFAULT_FAILURE_COOLDOWN_SECONDS
+			delay = _env_float(delay_name, default_delay, maximum=300)
+			if delay > 0:
+				reason = '账号间隔' if account_succeeded else '失败后冷却'
+				print(f'[INFO] {reason} {delay:g}s，随后处理下一个账号')
+				await asyncio.sleep(delay)
 
 	report.finished_at = datetime.now().astimezone().isoformat(timespec='seconds')
 	save_check_in_report(report)

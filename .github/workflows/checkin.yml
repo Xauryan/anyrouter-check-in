@@ -77,9 +77,10 @@ jobs:
       uses: actions/cache@v5
       with:
         path: .browser_profiles
-        key: browser-profiles-${{ runner.os }}-v1
+        key: browser-profiles-${{ runner.os }}-v2-${{ github.run_id }}
         restore-keys: |
-          browser-profiles-${{ runner.os }}-
+          browser-profiles-${{ runner.os }}-v2-
+          browser-profiles-${{ runner.os }}-v1
 
     - name: 配置代理
       env:
@@ -96,6 +97,12 @@ jobs:
         CHECKIN_HEADLESS: false
         CHECKIN_HUMANIZE: true
         CHECKIN_WAIT_TIMEOUT_MS: 120000
+        CHECKIN_LOGIN_MAX_ATTEMPTS: 2
+        CHECKIN_LOGIN_RETRY_DELAY_SECONDS: 15
+        CHECKIN_USER_INFO_MAX_ATTEMPTS: 3
+        CHECKIN_USER_INFO_RETRY_DELAY_SECONDS: 3
+        CHECKIN_ACCOUNT_DELAY_SECONDS: 5
+        CHECKIN_FAILURE_COOLDOWN_SECONDS: 30
         ANYROUTER_ACCOUNTS: ${{ secrets.ANYROUTER_ACCOUNTS }}
         PROVIDERS: ${{ secrets.PROVIDERS }}
         DINGDING_WEBHOOK: ${{ secrets.DINGDING_WEBHOOK }}

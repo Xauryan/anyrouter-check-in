@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 RESULTS_FILE_ENV = 'CHECKIN_RESULTS_FILE'
-REPORT_SCHEMA_VERSION = 1
+REPORT_SCHEMA_VERSION = 2
 
 CheckInStatus = Literal['pending', 'success', 'failure']
 
@@ -27,6 +27,7 @@ class AccountCheckInResult:
 	status: CheckInStatus = 'pending'
 	balance: float | None = None
 	used: float | None = None
+	reason: str | None = None
 
 
 @dataclass
@@ -107,6 +108,12 @@ def _format_status(status: object) -> str:
 	return status_labels.get(status_key, '⚪ 未知')
 
 
+def _format_reason(reason: object) -> str:
+	if not isinstance(reason, str) or not reason.strip():
+		return '—'
+	return _escape_table_cell(reason)
+
+
 def _format_step_outcome(step_outcome: str | None) -> str:
 	return {
 		'success': '✅ 成功',
@@ -150,8 +157,8 @@ def render_github_summary(report: dict[str, Any] | None, *, step_outcome: str | 
 	if accounts:
 		lines.extend(
 			[
-				'| 账号 | 服务商 | 签到状态 | 当前余额 | 累计消耗 |',
-				'|:--|:--|:--:|--:|--:|',
+				'| 账号 | 服务商 | 签到状态 | 当前余额 | 累计消耗 | 说明 |',
+				'|:--|:--|:--:|--:|--:|:--|',
 			]
 		)
 		for account in accounts:
@@ -163,7 +170,8 @@ def render_github_summary(report: dict[str, Any] | None, *, step_outcome: str | 
 				f'{_escape_table_cell(account.get("provider", "未知"))} | '
 				f'{_format_status(account.get("status"))} | '
 				f'{_format_money(account.get("balance"))} | '
-				f'{_format_money(account.get("used"))} |'
+				f'{_format_money(account.get("used"))} | '
+				f'{_format_reason(account.get("reason"))} |'
 			)
 	else:
 		lines.extend(['> 没有可展示的账号结果。', ''])
@@ -184,7 +192,7 @@ def render_github_summary(report: dict[str, Any] | None, *, step_outcome: str | 
 			'',
 			'</details>',
 			'',
-			'> 余额来自签到完成后的用户信息查询；“未获取”表示认证或余额查询未成功。',
+			'> 余额来自签到完成后的用户信息查询；“未获取”表示认证或余额查询未成功。失败说明为脱敏后的分类信息。',
 			'',
 		]
 	)

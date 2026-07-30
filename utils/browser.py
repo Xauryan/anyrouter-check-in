@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -54,6 +56,11 @@ FORM_ACTION_TIMEOUT_MS = 15_000
 EMAIL_TAB_TIMEOUT_MS = 8_000
 WAF_READY_TIMEOUT_MS = 30_000
 SESSION_WAIT_TIMEOUT_MS = 45_000
+LOGIN_RESULT_TIMEOUT_MS = 30_000
+LOGIN_NETWORK_IDLE_TIMEOUT_MS = 10_000
+USER_SELF_PASSIVE_TIMEOUT_MS = 10_000
+DEFAULT_USER_INFO_MAX_ATTEMPTS = 3
+DEFAULT_USER_INFO_RETRY_DELAY_SECONDS = 3.0
 
 _VISIBLE_CHECK_JS = """
 	const isVisible = (el) => {
@@ -163,11 +170,58 @@ def _env_bool(name: str, default: bool) -> bool:
 	return raw.strip().lower() in {'1', 'true', 'yes', 'on'}
 
 
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 10) -> int:
+	try:
+		value = int(os.getenv(name, str(default)))
+	except ValueError:
+		return default
+	return max(minimum, min(maximum, value))
+
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0, maximum: float = 300.0) -> float:
+	try:
+		value = float(os.getenv(name, str(default)))
+	except ValueError:
+		return default
+	return max(minimum, min(maximum, value))
+
+
+def build_browser_profile_key(provider: str, email: str) -> str:
+	"""生成不暴露邮箱、且不随显示名称变化的稳定 Profile 标识。"""
+	identity = f'{provider.strip().lower()}\0{email.strip().lower()}'
+	digest = hashlib.sha256(identity.encode('utf-8')).hexdigest()[:20]
+	return f'account-{digest}'
+
+
+def _migrate_legacy_profile(profile_base: Path, provider: str, account_name: str, profile_dir: Path) -> None:
+	"""把旧的显示名称目录复制到稳定 Profile 目录，保留已有登录状态。"""
+	if profile_dir.exists() or not account_name or account_name in {'.', '..'}:
+		return
+	if Path(account_name).name != account_name:
+		return
+
+	legacy_profile_dir = profile_base / provider / account_name
+	if not legacy_profile_dir.is_dir() or legacy_profile_dir == profile_dir:
+		return
+
+	try:
+		shutil.copytree(legacy_profile_dir, profile_dir)
+		print(f'[INFO] {account_name}: Migrated browser profile to stable account identity')
+	except Exception as exc:
+		print(f'[WARN] {account_name}: Failed to migrate legacy browser profile: {exc}')
+
+
 def load_browser_login_settings(
-	account_name: str, provider: str, *, persist_profile: bool = True
+	account_name: str,
+	provider: str,
+	*,
+	persist_profile: bool = True,
+	profile_key: str | None = None,
 ) -> BrowserLoginSettings:
 	profile_base = Path(os.getenv('CHECKIN_BROWSER_PROFILE_DIR', '.browser_profiles'))
-	profile_dir = profile_base / provider / account_name
+	profile_dir = profile_base / provider / (profile_key or account_name)
+	if persist_profile and profile_key:
+		_migrate_legacy_profile(profile_base, provider, account_name, profile_dir)
 	humanize = _env_bool('CHECKIN_HUMANIZE', True)
 	if provider == 'agentrouter':
 		humanize = _env_bool('CHECKIN_HUMANIZE_AGENTROUTER', humanize)
@@ -440,9 +494,64 @@ async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_
 	return False
 
 
+async def wait_for_login_signal(page: Page, timeout_ms: int = LOGIN_RESULT_TIMEOUT_MS) -> bool:
+	"""等待 URL 或 session Cookie 表明登录已经建立。"""
+	deadline = time.monotonic() + timeout_ms / 1000
+	while time.monotonic() < deadline:
+		if await is_logged_in(page) or await has_session_cookie(page):
+			return True
+		await asyncio.sleep(0.5)
+	return False
+
+
+async def _fetch_user_profile(page: Page) -> tuple[dict | None, int | None]:
+	"""在浏览器会话中主动查询用户信息，仅返回资料与 HTTP 状态。"""
+	try:
+		result = await page.evaluate(
+			"""async (url) => {
+				try {
+					const response = await fetch(url, {
+						method: 'GET',
+						credentials: 'include',
+						cache: 'no-store',
+						headers: { Accept: 'application/json' },
+					});
+					let payload = null;
+					try {
+						payload = await response.json();
+					} catch (_) {}
+					return { status: response.status, payload };
+				} catch (_) {
+					return { status: null, payload: null };
+				}
+			}""",
+			USER_SELF_API_SUFFIX,
+		)
+	except Exception as exc:
+		debug_print(f'[INFO] Explicit {USER_SELF_API_SUFFIX} request failed: {exc}')
+		return None, None
+
+	if not isinstance(result, dict):
+		return None, None
+	status = result.get('status')
+	status_code = status if isinstance(status, int) and not isinstance(status, bool) else None
+	return _extract_user_profile(result.get('payload')), status_code
+
+
 async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。"""
-	verify_timeout = min(timeout_ms, SESSION_WAIT_TIMEOUT_MS)
+	"""跳转 /console，并通过被动拦截和主动重试确认登录用户。"""
+	verify_timeout = min(timeout_ms, USER_SELF_PASSIVE_TIMEOUT_MS)
+	max_attempts = _env_int(
+		'CHECKIN_USER_INFO_MAX_ATTEMPTS',
+		DEFAULT_USER_INFO_MAX_ATTEMPTS,
+		minimum=1,
+		maximum=5,
+	)
+	retry_delay = _env_float(
+		'CHECKIN_USER_INFO_RETRY_DELAY_SECONDS',
+		DEFAULT_USER_INFO_RETRY_DELAY_SECONDS,
+		maximum=60,
+	)
 	captured_profile: dict | None = None
 	verified = asyncio.Event()
 
@@ -459,27 +568,47 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 	try:
 		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
 		await page.goto(console_url, wait_until='load', timeout=min(timeout_ms, 60_000))
-		try:
-			await page.wait_for_load_state('networkidle', timeout=20_000)
-		except Exception:  # nosec B110
-			pass
+		await _wait_for_optional_load_state(page, 'networkidle', LOGIN_NETWORK_IDLE_TIMEOUT_MS)
 
 		if captured_profile is None:
 			try:
 				await asyncio.wait_for(verified.wait(), timeout=verify_timeout / 1000)
 			except TimeoutError:
 				pass
+
+		if captured_profile:
+			print('[INFO] Login verified')
+			return captured_profile
+
+		for attempt in range(1, max_attempts + 1):
+			profile, status_code = await _fetch_user_profile(page)
+			if profile:
+				print(f'[INFO] Login verified via explicit {USER_SELF_API_SUFFIX} request')
+				return profile
+
+			status_label = str(status_code) if status_code is not None else 'unavailable'
+			print(
+				f'[WARN] Explicit {USER_SELF_API_SUFFIX} attempt {attempt}/{max_attempts} failed (HTTP {status_label})'
+			)
+			if attempt >= max_attempts:
+				break
+
+			if attempt == 1 and CONSOLE_PATH in page.url.lower():
+				print(f'[INFO] Reloading {CONSOLE_PATH} before retrying user verification')
+				try:
+					await page.reload(wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
+					await _wait_for_optional_load_state(page, 'networkidle', LOGIN_NETWORK_IDLE_TIMEOUT_MS)
+				except Exception as exc:
+					debug_print(f'[INFO] Console reload failed: {exc}')
+				if captured_profile:
+					print('[INFO] Login verified after console reload')
+					return captured_profile
+
+			delay = retry_delay * attempt
+			if delay > 0:
+				await asyncio.sleep(delay)
 	finally:
 		page.remove_listener('response', on_response)
-
-	if captured_profile:
-		if is_debug_enabled():
-			user_id = captured_profile.get('id')
-			username = captured_profile.get('username', '')
-			print(f'[INFO] Login verified via {USER_SELF_API_SUFFIX}: id={user_id}, username={username}')
-		else:
-			print('[INFO] Login verified')
-		return captured_profile
 
 	if CONSOLE_PATH in page.url.lower():
 		print(f'[WARN] Reached {CONSOLE_PATH} but {USER_SELF_API_SUFFIX} returned no user profile')
@@ -750,7 +879,7 @@ async def fill_email_credentials(page: Page, email: str, password: str, timeout_
 	await _set_input_value(password_input, password, action_timeout)
 
 
-async def submit_login_form(page: Page, timeout_ms: int) -> None:
+async def submit_login_form(page: Page, timeout_ms: int) -> bool:
 	action_timeout = min(timeout_ms, FORM_ACTION_TIMEOUT_MS)
 	submit = await _first_visible_locator(page, SUBMIT_SELECTORS)
 	if not submit:
@@ -769,8 +898,8 @@ async def submit_login_form(page: Page, timeout_ms: int) -> None:
 	except Exception:
 		await submit.click(force=True, timeout=action_timeout)
 	await _wait_for_optional_load_state(page, 'domcontentloaded', action_timeout)
-	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, 30_000))
-	await wait_for_logged_in(page, SESSION_WAIT_TIMEOUT_MS)
+	await _wait_for_optional_load_state(page, 'networkidle', min(timeout_ms, LOGIN_NETWORK_IDLE_TIMEOUT_MS))
+	return await wait_for_login_signal(page, min(timeout_ms, LOGIN_RESULT_TIMEOUT_MS))
 
 
 async def login_with_email_form(
@@ -781,7 +910,7 @@ async def login_with_email_form(
 	*,
 	provider: str = '',
 	account_name: str = '',
-) -> None:
+) -> bool:
 	await _open_email_login_form(
 		page,
 		timeout_ms,
@@ -789,4 +918,4 @@ async def login_with_email_form(
 		account_name=account_name,
 	)
 	await fill_email_credentials(page, email, password, timeout_ms)
-	await submit_login_form(page, timeout_ms)
+	return await submit_login_form(page, timeout_ms)
